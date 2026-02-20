@@ -1,41 +1,16 @@
 import json
 import re
-import urllib.parse
 import urllib.request
+import urllib.parse
 import urllib.error
-from typing import Any, Dict, Optional, List, Tuple
-
-import streamlit as st
-
-# -----------------------------
-# HTTP (stdlib only)
-# -----------------------------
-def http_get(url: str, timeout: int = 25) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nasdaq.com/",
-        "Connection": "close",
-    }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-    return raw.decode("utf-8", errors="replace")
-
-
-def http_get_json(url: str, timeout: int = 25) -> Dict[str, Any]:
-    return json.loads(http_get(url, timeout=timeout))
-
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 # -----------------------------
-# Parsing helpers
+# Helpers: parse inputs
 # -----------------------------
-def normalize_option_code(option_code_or_slug_or_url: str) -> str:
-    s = option_code_or_slug_or_url.strip()
+def normalize_option_code(code_or_slug_or_url: str) -> str:
+    s = code_or_slug_or_url.strip()
     if "://" in s:
         s = s.split("?", 1)[0].rstrip("/")
         s = s.rsplit("/", 1)[-1]
@@ -43,268 +18,179 @@ def normalize_option_code(option_code_or_slug_or_url: str) -> str:
         s = s.split("---", 1)[-1]
     return s.lower()
 
-
 def parse_symbol_from_nasdaq_url(url: str) -> Optional[str]:
     m = re.search(r"/market-activity/stocks/([a-z0-9\.-]+)/option-chain/", url.lower())
     return m.group(1) if m else None
 
-
-def iter_option_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    data = payload.get("data") or {}
-    table = data.get("table") or {}
-    rows = table.get("rows") or []
-    return rows if isinstance(rows, list) else []
-
-
-def extract_expirations(payload: Dict[str, Any]) -> List[str]:
+def parse_code_parts(option_code: str) -> Tuple[int, int, int, str, float, str]:
     """
-    Nasdaq sometimes includes available expirations list in:
-      payload["data"]["expirations"]  OR other shapes.
-    We try a few common places.
+    option_code like: 271217c00370000
+      YYMMDD  = 271217 -> 2027-12-17
+      CP      = c / p
+      STRIKE8 = 00370000 -> 370.000 (8 digits, thousandths)
+    Returns: (year, month, day, cp, strike, strike8)
     """
-    data = payload.get("data") or {}
+    code = normalize_option_code(option_code)
 
-    # common candidates
-    candidates = []
-    for key in ("expirations", "expirationDates", "dates", "expirationDateList"):
-        v = data.get(key)
-        if isinstance(v, list):
-            candidates.extend([str(x) for x in v if x])
-        elif isinstance(v, dict):
-            # sometimes { "rows": [...] } etc.
-            rows = v.get("rows")
-            if isinstance(rows, list):
-                candidates.extend([str(x) for x in rows if x])
+    m = re.fullmatch(r"(\d{6})([cp])(\d{8})", code)
+    if not m:
+        raise ValueError("Bad option_code format. Expected like 271217c00370000")
 
-    # de-dup, keep order
-    out = []
-    seen = set()
-    for x in candidates:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
+    yymmdd, cp, strike8 = m.groups()
+    yy = int(yymmdd[0:2])
+    mm = int(yymmdd[2:4])
+    dd = int(yymmdd[4:6])
 
+    year = 2000 + yy  # OCC uses 2-digit year; assume 20xx
+    strike = int(strike8) / 1000.0
 
-def match_contract_dict(d: Any, option_code: str) -> bool:
-    if not isinstance(d, dict):
-        return False
-    option_code = option_code.lower()
+    return year, mm, dd, cp.upper(), strike, strike8
 
-    for k in ("optionSymbol", "symbol", "contractSymbol", "displaySymbol"):
-        v = d.get(k)
-        if isinstance(v, str) and option_code in v.lower():
-            return True
+def build_occ_contract_symbol(underlying: str, option_code: str) -> str:
+    """
+    OCC contract symbol like: AMD271217C00370000
+    """
+    underlying = underlying.upper().strip()
+    year, mm, dd, cp, strike, strike8 = parse_code_parts(option_code)
+    yymmdd = f"{year % 100:02d}{mm:02d}{dd:02d}"
+    return f"{underlying}{yymmdd}{cp}{strike8}"
 
-    for v in d.values():
-        if isinstance(v, str) and option_code in v.lower():
-            return True
+def expiration_to_unix_utc(year: int, month: int, day: int) -> int:
+    """
+    Yahoo option-chain expects 'date' parameter as unix timestamp (seconds) for expiration date.
+    We'll use 00:00:00 UTC of that day; Yahoo typically matches by date.
+    """
+    dt = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
-    return False
-
-
-def normalize_quote_fields(contract: Dict[str, Any]) -> Dict[str, Any]:
-    key_map = {
-        "optionSymbol": "option_symbol",
-        "symbol": "option_symbol",
-        "contractSymbol": "option_symbol",
-        "displaySymbol": "option_symbol",
-        "bid": "bid",
-        "ask": "ask",
-        "last": "last",
-        "lastPrice": "last",
-        "lastSalePrice": "last",
-        "volume": "volume",
-        "openInterest": "open_interest",
-        "impliedVolatility": "iv",
-        "strikePrice": "strike",
-        "expirationDate": "expiration",
-        "expiryDate": "expiration",
+# -----------------------------
+# HTTP (stdlib only)
+# -----------------------------
+def http_get_json(url: str, timeout: int = 25) -> Dict[str, Any]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PythonStdlib/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
     }
-    out: Dict[str, Any] = {}
-    for src, dst in key_map.items():
-        if src in contract and contract[src] not in (None, ""):
-            out.setdefault(dst, contract[src])
-    out["_raw"] = contract
-    return out
-
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    txt = raw.decode("utf-8", errors="replace")
+    return json.loads(txt)
 
 # -----------------------------
-# Nasdaq option-chain fetching
+# Yahoo option chain lookup
 # -----------------------------
-def build_option_chain_url(symbol: str, params: Dict[str, str]) -> str:
-    base = f"https://api.nasdaq.com/api/quote/{symbol}/option-chain"
-    q = {"assetclass": "stocks"}
-    q.update({k: v for k, v in params.items() if v})
-    return base + "?" + urllib.parse.urlencode(q)
-
-
-def fetch_chain(symbol: str, params: Dict[str, str]) -> Dict[str, Any]:
-    url = build_option_chain_url(symbol, params)
+def fetch_yahoo_option_chain(underlying: str, expiration_unix: int) -> Dict[str, Any]:
+    """
+    Endpoint:
+      https://query2.finance.yahoo.com/v7/finance/options/{symbol}?date={unix}
+    """
+    sym = underlying.upper().strip()
+    url = f"https://query2.finance.yahoo.com/v7/finance/options/{urllib.parse.quote(sym)}?date={expiration_unix}"
     return http_get_json(url)
 
-
-def find_contract_in_payload(payload: Dict[str, Any], option_code: str) -> Optional[Dict[str, Any]]:
-    for row in iter_option_rows(payload):
-        call = row.get("call")
-        if match_contract_dict(call, option_code):
-            out = normalize_quote_fields(call)
-            out["type"] = "call"
-            return out
-
-        put = row.get("put")
-        if match_contract_dict(put, option_code):
-            out = normalize_quote_fields(put)
-            out["type"] = "put"
-            return out
-
-        if match_contract_dict(row, option_code):
-            out = normalize_quote_fields(row)
-            out["type"] = "unknown"
-            return out
-
-    return None
-
-
-def get_option_quote_by_code(symbol: str, option_code: str, log_fn=None) -> Dict[str, Any]:
+def find_contract_in_yahoo(payload: Dict[str, Any], contract_symbol: str, cp: str) -> Optional[Dict[str, Any]]:
     """
-    1) Fetch default chain
-    2) If not found, try iterating expirations (if present) with multiple possible param names.
+    Searches calls/puts for exact contractSymbol match.
     """
-    symbol = symbol.lower().strip()
-    option_code = normalize_option_code(option_code)
+    try:
+        result = payload["optionChain"]["result"]
+        if not result:
+            return None
+        opt = result[0].get("options", [])
+        if not opt:
+            return None
+        chain = opt[0]
+        side = "calls" if cp == "C" else "puts"
+        items = chain.get(side, []) or []
+        for it in items:
+            if str(it.get("contractSymbol", "")).upper() == contract_symbol.upper():
+                return it
+        return None
+    except Exception:
+        return None
 
-    # Step 1: default request
-    payload = fetch_chain(symbol, params={})
-    found = find_contract_in_payload(payload, option_code)
-    if found:
-        found.update({"underlying": symbol, "option_code": option_code, "source": "api.nasdaq.com"})
-        return found
+def get_option_quote_yahoo(underlying: str, option_code: str) -> Dict[str, Any]:
+    """
+    Returns normalized quote fields for the given option_code using Yahoo.
+    """
+    year, mm, dd, cp, strike, strike8 = parse_code_parts(option_code)
+    expiration_unix = expiration_to_unix_utc(year, mm, dd)
+    contract_symbol = build_occ_contract_symbol(underlying, option_code)
 
-    expirations = extract_expirations(payload)
-    if log_fn:
-        log_fn(f"Not found in default chain. expirations discovered: {len(expirations)}")
+    payload = fetch_yahoo_option_chain(underlying, expiration_unix)
+    contract = find_contract_in_yahoo(payload, contract_symbol, cp)
 
-    if not expirations:
+    if not contract:
+        # Helpful debug hints
+        available = []
+        try:
+            opt = payload["optionChain"]["result"][0]["options"][0]
+            available = [x.get("contractSymbol") for x in opt.get("calls" if cp == "C" else "puts", [])[:10]]
+        except Exception:
+            pass
         raise RuntimeError(
-            "Contract not found in default option-chain response, and no expirations list available. "
-            "Nasdaq may have changed the payload shape."
+            f"Contract not found on Yahoo for expiration {year}-{mm:02d}-{dd:02d}. "
+            f"Looking for contractSymbol={contract_symbol}. "
+            f"Sample symbols from that chain: {available}"
         )
 
-    # Nasdaq parameter name can vary; try a small set
-    param_names = ["expirationdate", "expirationDate", "expiryDate", "date", "expiration"]
-    tried = 0
-
-    for exp in expirations:
-        for pname in param_names:
-            tried += 1
-            if log_fn and tried % 10 == 0:
-                log_fn(f"Trying expirations… attempts: {tried}")
-
-            try:
-                payload2 = fetch_chain(symbol, params={pname: exp})
-            except Exception:
-                continue
-
-            found2 = find_contract_in_payload(payload2, option_code)
-            if found2:
-                found2.update({
-                    "underlying": symbol,
-                    "option_code": option_code,
-                    "source": "api.nasdaq.com",
-                    "queried_expiration": exp,
-                    "queried_param": pname,
-                })
-                return found2
-
-    raise RuntimeError(f"Contract not found after checking {len(expirations)} expirations.")
-
+    # Normalize output
+    out = {
+        "underlying": underlying.upper(),
+        "option_code": normalize_option_code(option_code),
+        "contractSymbol": contract.get("contractSymbol"),
+        "type": "call" if cp == "C" else "put",
+        "expiration": f"{year}-{mm:02d}-{dd:02d}",
+        "strike": contract.get("strike", strike),
+        "currency": contract.get("currency"),
+        "last": contract.get("lastPrice"),
+        "bid": contract.get("bid"),
+        "ask": contract.get("ask"),
+        "change": contract.get("change"),
+        "percentChange": contract.get("percentChange"),
+        "volume": contract.get("volume"),
+        "openInterest": contract.get("openInterest"),
+        "impliedVolatility": contract.get("impliedVolatility"),
+        "inTheMoney": contract.get("inTheMoney"),
+        "contractSize": contract.get("contractSize"),
+        "lastTradeDate": contract.get("lastTradeDate"),  # unix
+        "_raw": contract,  # keep everything
+    }
+    return out
 
 # -----------------------------
-# Streamlit UI
+# Convenience: accept Nasdaq URL
 # -----------------------------
-st.set_page_config(page_title="Nasdaq Option Ask by Code", layout="wide")
-st.title("Nasdaq: получить ASK по коду опциона")
-st.caption("Источник: api.nasdaq.com (тот же JSON, который часто использует сайт Nasdaq).")
-
-url_or_symbol = st.text_input(
-    "Nasdaq URL (рекомендуется) ИЛИ symbol (например, amd)",
-    value="https://www.nasdaq.com/market-activity/stocks/amd/option-chain/call-put-options/amd---271217c00370000",
-)
-option_code_input = st.text_input(
-    "Option code (если не URL). Пример: 271217c00370000",
-    value="",
-)
-
-run = st.button("Fetch", type="primary")
-
-log_box = st.empty()
-
-def log(msg: str):
-    st.session_state.setdefault("log", [])
-    st.session_state["log"].append(msg)
-    log_box.code("\n".join(st.session_state["log"][-20:]))
-
-if run:
-    st.session_state["log"] = []
-
-    # Determine symbol + code
-    if "://" in url_or_symbol:
-        symbol = parse_symbol_from_nasdaq_url(url_or_symbol)
-        if not symbol:
-            st.error("Не смог извлечь symbol из URL. Введи symbol вручную.")
-            st.stop()
-        option_code = normalize_option_code(url_or_symbol)
+def get_ask(underlying_or_url: str, option_code: Optional[str] = None) -> Any:
+    """
+    - get_ask("AMD", "271217c00370000")
+    - get_ask("https://www.nasdaq.com/.../amd---271217c00370000")
+    """
+    if option_code is None:
+        url = underlying_or_url
+        sym = parse_symbol_from_nasdaq_url(url)
+        if not sym:
+            raise ValueError("Could not parse symbol from URL; pass symbol explicitly.")
+        code = normalize_option_code(url)
+        quote = get_option_quote_yahoo(sym, code)
     else:
-        symbol = url_or_symbol.strip().lower()
-        if not symbol:
-            st.error("Введи symbol или URL.")
-            st.stop()
-        if not option_code_input.strip():
-            st.error("Если вводишь symbol, нужно указать option_code.")
-            st.stop()
-        option_code = normalize_option_code(option_code_input)
+        quote = get_option_quote_yahoo(underlying_or_url, option_code)
+    return quote.get("ask")
 
-    st.info(f"Symbol: {symbol} | option_code: {option_code}")
+# -----------------------------
+# Example
+# -----------------------------
+if __name__ == "__main__":
+    nasdaq_url = "https://www.nasdaq.com/market-activity/stocks/amd/option-chain/call-put-options/amd---271217c00370000"
+    sym = parse_symbol_from_nasdaq_url(nasdaq_url) or "AMD"
+    code = normalize_option_code(nasdaq_url)
 
-    try:
-        quote = get_option_quote_by_code(symbol, option_code, log_fn=log)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    # Show main fields
-    st.subheader("Result")
-    cols = st.columns(4)
-    cols[0].metric("ASK", str(quote.get("ask", "")))
-    cols[1].metric("BID", str(quote.get("bid", "")))
-    cols[2].metric("LAST", str(quote.get("last", "")))
-    cols[3].metric("TYPE", str(quote.get("type", "")))
-
-    st.write({
-        "underlying": quote.get("underlying"),
-        "option_code": quote.get("option_code"),
-        "option_symbol": quote.get("option_symbol"),
-        "queried_expiration": quote.get("queried_expiration", ""),
-        "queried_param": quote.get("queried_param", ""),
-        "volume": quote.get("volume", ""),
-        "open_interest": quote.get("open_interest", ""),
-        "iv": quote.get("iv", ""),
-        "strike": quote.get("strike", ""),
-        "expiration": quote.get("expiration", ""),
-        "source": quote.get("source", ""),
-    })
-
-    # Download raw
-    raw_json = json.dumps(quote, ensure_ascii=False, indent=2).encode("utf-8")
-    st.download_button(
-        "Download raw JSON",
-        data=raw_json,
-        file_name=f"{symbol}_{option_code}_quote.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    with st.expander("Raw node"):
-        st.json(quote.get("_raw", {}))
-
+    q = get_option_quote_yahoo(sym, code)
+    print("ASK:", q.get("ask"))
+    print("BID:", q.get("bid"))
+    print("LAST:", q.get("last"))
+    print("OI:", q.get("openInterest"), "VOL:", q.get("volume"), "IV:", q.get("impliedVolatility"))
+    print("Contract:", q.get("contractSymbol"))
