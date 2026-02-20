@@ -308,4 +308,3 @@ if run:
     with st.expander("Raw node"):
         st.json(quote.get("_raw", {}))
 
-st.write(payload)
