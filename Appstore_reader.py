@@ -25,6 +25,21 @@ Original file is located at
 #   If Apple includes any device/platform hints in the future (rare), this script will capture them
 #   as additional columns when present.
 
+import streamlit as st
+
+st.title("App Store Reviews → CSV")
+
+app_url = st.text_input("Apple App Store URL", "")
+max_reviews = st.number_input("MAX_REVIEWS", 1, 500, 100)
+
+run = st.button("Fetch")
+
+st.write("DEBUG:", app_url)  # чтобы точно видеть, что UI живой
+
+if run:
+    st.write("Running…")
+    # тут уже твой код fetch/parse
+
 import re
 import csv
 import sys
