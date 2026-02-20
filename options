@@ -1,0 +1,258 @@
+import json
+import re
+import urllib.request
+import urllib.error
+from typing import Any, Dict, Optional, Tuple
+
+# -----------------------------
+# HTTP helpers (stdlib only)
+# -----------------------------
+def http_get(url: str, timeout: int = 25) -> str:
+    """
+    Nasdaq often blocks default Python UA; use browser-like headers.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nasdaq.com/",
+        "Connection": "close",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def http_get_json(url: str, timeout: int = 25) -> Dict[str, Any]:
+    txt = http_get(url, timeout=timeout)
+    return json.loads(txt)
+
+
+# -----------------------------------------
+# Inputs: parse code / symbol
+# -----------------------------------------
+def normalize_option_code(option_code_or_slug_or_url: str) -> str:
+    """
+    Accepts:
+      - "271217c00370000"
+      - "amd---271217c00370000"
+      - full URL ending with ".../amd---271217c00370000"
+    Returns: "271217c00370000"
+    """
+    s = option_code_or_slug_or_url.strip()
+
+    # If URL -> last path segment
+    if "://" in s:
+        s = s.split("?", 1)[0].rstrip("/")
+        s = s.rsplit("/", 1)[-1]
+
+    # If slug contains --- -> keep right part
+    if "---" in s:
+        s = s.split("---", 1)[-1]
+
+    return s.lower()
+
+
+def parse_symbol_from_nasdaq_url(url: str) -> Optional[str]:
+    """
+    Extract underlying symbol from:
+      https://www.nasdaq.com/market-activity/stocks/amd/option-chain/...
+    """
+    m = re.search(r"/market-activity/stocks/([a-z0-9\.-]+)/option-chain/", url.lower())
+    return m.group(1) if m else None
+
+
+# -----------------------------------------
+# Core: find contract in Nasdaq option-chain
+# -----------------------------------------
+def fetch_nasdaq_option_chain(symbol: str) -> Dict[str, Any]:
+    """
+    Public JSON used by Nasdaq web:
+      https://api.nasdaq.com/api/quote/{symbol}/option-chain?assetclass=stocks
+    """
+    symbol = symbol.lower().strip()
+    url = f"https://api.nasdaq.com/api/quote/{symbol}/option-chain?assetclass=stocks"
+    return http_get_json(url)
+
+
+def iter_option_rows(payload: Dict[str, Any]):
+    """
+    Nasdaq JSON shape can vary. Most common:
+      payload["data"]["table"]["rows"] -> list
+    Each row often has row["call"] and row["put"] dicts.
+    We keep it tolerant.
+    """
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") or {}
+    table = data.get("table") or {}
+    rows = table.get("rows") or []
+    if isinstance(rows, list):
+        return rows
+    return []
+
+
+def match_contract_dict(d: Any, option_code: str) -> bool:
+    """
+    Check if a dict contains our option_code in any likely symbol fields.
+    """
+    if not isinstance(d, dict):
+        return False
+    option_code = option_code.lower()
+
+    # most common key in Nasdaq option chain rows
+    for k in ("optionSymbol", "symbol", "contractSymbol", "displaySymbol"):
+        v = d.get(k)
+        if isinstance(v, str) and option_code in v.lower():
+            return True
+
+    # fallback: any string value containing the code
+    for v in d.values():
+        if isinstance(v, str) and option_code in v.lower():
+            return True
+
+    return False
+
+
+def normalize_quote_fields(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a stable set of keys (as available).
+    Nasdaq may return numbers as strings like "$1.23" or "1.23".
+    We keep raw values without forcing numeric parsing.
+    """
+    # map possible source keys -> normalized output keys
+    key_map = {
+        # identifiers
+        "optionSymbol": "option_symbol",
+        "symbol": "option_symbol",
+        "contractSymbol": "option_symbol",
+        "displaySymbol": "option_symbol",
+
+        # prices
+        "bid": "bid",
+        "ask": "ask",
+        "last": "last",
+        "lastPrice": "last",
+        "lastSalePrice": "last",
+
+        # greeks / iv (if present)
+        "impliedVolatility": "iv",
+        "iv": "iv",
+        "delta": "delta",
+        "gamma": "gamma",
+        "theta": "theta",
+        "vega": "vega",
+
+        # volume / OI
+        "volume": "volume",
+        "openInterest": "open_interest",
+        "open_interest": "open_interest",
+
+        # strike / expiry
+        "strikePrice": "strike",
+        "strike": "strike",
+        "expirationDate": "expiration",
+        "expiryDate": "expiration",
+
+        # change fields
+        "change": "change",
+        "netChange": "change",
+        "percentChange": "percent_change",
+    }
+
+    out: Dict[str, Any] = {}
+    for src_k, dst_k in key_map.items():
+        if src_k in contract and contract[src_k] not in (None, ""):
+            # if multiple src map to same dst, don't overwrite once set
+            out.setdefault(dst_k, contract[src_k])
+
+    # Also keep the raw contract (optional, comment out if не нужно)
+    out["_raw"] = contract
+    return out
+
+
+def get_option_quote_by_code(symbol: str, option_code: str) -> Dict[str, Any]:
+    """
+    Fetch option chain for symbol and extract the contract by option_code.
+    Returns normalized dict with keys like bid/ask/last/open_interest/iv...
+    Raises RuntimeError if not found or request fails.
+    """
+    symbol = symbol.lower().strip()
+    option_code = normalize_option_code(option_code)
+
+    try:
+        payload = fetch_nasdaq_option_chain(symbol)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+        raise RuntimeError(f"Failed to fetch Nasdaq option chain for {symbol}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error fetching Nasdaq option chain for {symbol}: {e}")
+
+    for row in iter_option_rows(payload):
+        # Many payloads: row["call"] and row["put"]
+        call = row.get("call")
+        if match_contract_dict(call, option_code):
+            out = normalize_quote_fields(call)
+            out.update({"underlying": symbol, "type": "call", "option_code": option_code, "source": "api.nasdaq.com"})
+            return out
+
+        put = row.get("put")
+        if match_contract_dict(put, option_code):
+            out = normalize_quote_fields(put)
+            out.update({"underlying": symbol, "type": "put", "option_code": option_code, "source": "api.nasdaq.com"})
+            return out
+
+        # Some variants store contracts without nesting
+        if match_contract_dict(row, option_code):
+            out = normalize_quote_fields(row)
+            out.update({"underlying": symbol, "type": "unknown", "option_code": option_code, "source": "api.nasdaq.com"})
+            return out
+
+    raise RuntimeError(f"Contract not found in option chain: {symbol} / {option_code}")
+
+
+def get_option_ask(symbol_or_url: str, option_code: Optional[str] = None) -> Any:
+    """
+    Convenience wrapper:
+      - get_option_ask("amd", "271217c00370000")
+      - get_option_ask("https://www.nasdaq.com/.../amd---271217c00370000")
+    Returns ask (raw value from Nasdaq) or raises if not found.
+    """
+    if option_code is None:
+        # symbol_or_url is a URL
+        url = symbol_or_url
+        symbol = parse_symbol_from_nasdaq_url(url)
+        if not symbol:
+            raise ValueError("Could not parse symbol from URL; pass symbol explicitly.")
+        code = normalize_option_code(url)
+    else:
+        symbol = symbol_or_url
+        code = option_code
+
+    quote = get_option_quote_by_code(symbol, code)
+    return quote.get("ask")
+
+
+# -----------------------------
+# Example
+# -----------------------------
+if __name__ == "__main__":
+    # Example from your link:
+    url = "https://www.nasdaq.com/market-activity/stocks/amd/option-chain/call-put-options/amd---271217c00370000"
+
+    # 1) Get full quote
+    symbol = parse_symbol_from_nasdaq_url(url) or "amd"
+    code = normalize_option_code(url)
+    q = get_option_quote_by_code(symbol, code)
+
+    print("QUOTE (normalized):")
+    for k in ("underlying", "type", "option_code", "option_symbol", "bid", "ask", "last", "volume", "open_interest", "iv", "strike", "expiration"):
+        if k in q:
+            print(f"  {k}: {q[k]}")
+
+    # 2) Or ask only
+    ask = get_option_ask(url)
+    print("\nASK:", ask)
