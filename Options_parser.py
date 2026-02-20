@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List, Tuple
 
 import streamlit as st
 
+st.write(payload)
 
 # -----------------------------
 # HTTP (stdlib only)
