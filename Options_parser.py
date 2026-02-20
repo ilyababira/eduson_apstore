@@ -7,8 +7,6 @@ from typing import Any, Dict, Optional, List, Tuple
 
 import streamlit as st
 
-st.write(payload)
-
 # -----------------------------
 # HTTP (stdlib only)
 # -----------------------------
@@ -309,3 +307,5 @@ if run:
 
     with st.expander("Raw node"):
         st.json(quote.get("_raw", {}))
+
+st.write(payload)
